@@ -1,167 +1,137 @@
+"""
+PackagingPal – AI Sourcing Assistant (v2  stable)
+"""
+# ---- imports & config -------------------------------------------------------
+import json, base64, requests
+from typing import List, Dict, Optional
 import streamlit as st
 from openai import OpenAI
-from io import BytesIO
-import base64
-import re
-from streamlit_chat import message  # Using streamlit-chat to render chat bubbles
 
-###############################################################################
-# 1) Configuration & Session State
-###############################################################################
+st.set_page_config("PackagingPal – AI Sourcing Assistant", layout="wide")
 
+API_BASE_URL   = "https://freeform-search-impacked-19a53d14c347.herokuapp.com/api"
+VECTOR_STORE_ID = "vs_67fd31e9c4c081919a9c34d1be81e2d9"
 client = OpenAI()
 
-if "messages" not in st.session_state:
-    st.session_state.messages = []
+# ---- session state ----------------------------------------------------------
+ss = st.session_state
+if "messages" not in ss:  ss.messages = []
+if "thread_id" not in ss: ss.thread_id = None
+if "image"     not in ss: ss.image     = None
 
-if "developer_instructions" not in st.session_state:
-    st.session_state.developer_instructions = """
-    You are an expert assistant specializing in packaging and cosmetics products. Your role is to help users find matching products by searching a vector store based on their query. Engage intuitively and provide assistance by asking follow-up questions when necessary (prior to executing another search of the files) to refine and narrow down the options available.
+SYSTEM_PROMPT = """
+You are **PackagingPal** …
+(unchanged text with ###SEARCH### and JSON‑block instructions)
+"""
 
-    When interacting with the user:
+# ---- helpers ---------------------------------------------------------------
+def impacked_search(q: str, k: int = 50) -> List[Dict]:
+    url = f"{API_BASE_URL}/search"
+    payload = {"query": q, "top_k": k}
+    print(f"[DEBUG] POST {url} | {payload}", flush=True)
+    try:
+        r = requests.post(url, json=payload, timeout=25)
+        print(f"[DEBUG] status {r.status_code}", flush=True)
+        r.raise_for_status()
+        return r.json()
+    except Exception as exc:
+        st.error(f"Impacked /search error: {exc}")
+        return []
 
-    - Listen carefully to the user's initial query.
-    - Utilize your expertise to understand and interpret ambiguous or broad queries.
-    - Conduct a thorough search in the vector store to identify potential matches.
-    - If needed, formulate concise follow-up questions to gather additional information, helping to clarify user needs and refine search criteria.
+def first_image(p: Dict) -> Optional[str]:
+    for k in ("image_url", *(f"image_url_{i}" for i in range(1, 6))):
+        if p.get(k): return p[k]
+    imgs = p.get("image_urls")
+    if isinstance(imgs, list) and imgs: return str(imgs[0]).strip("{} ")
+    return None
 
-    # Steps
+def hits_for_llm(h: List[Dict], k: int = 12) -> str:
+    return json.dumps([{
+        "id":     x.get("id"),
+        "title":  x.get("title"),
+        "supplier": x.get("company_name"),
+        "score":  round(x.get("score", 0), 3),
+        "image_url": first_image(x)
+    } for x in h[:k]], ensure_ascii=False)
 
-    1. **Understand the Query:** Analyze the user's initial query for specific keywords or product categories.
-    2. **Search the Vector Store:** Use the information provided to search the vector store for suitable product matches.
-    3. **Follow-Up Questions:** If results are too broad or unclear, ask pertinent, concise questions to narrow down.
-    4. **Provide Product Suggestions:** Offer a list of product matches based on refined criteria.
-    5. **Further Assistance:** Be prepared to offer additional insights or suggestions if the user requires further information.
+def send(events, tools=None, max_tokens=1200):
+    print(f"[DEBUG] send | tools={tools}", flush=True)
+    params = dict(model="gpt-4.1", input=events, stream=True,
+                  max_output_tokens=max_tokens)
+    if tools:        params["tools"] = tools
+    if ss.thread_id: params["thread_id"] = ss.thread_id
+    txt = ""
+    for ev in client.responses.create(**params):
+        if not ss.thread_id and getattr(ev, "thread_id", None):
+            ss.thread_id = ev.thread_id
+        if ev.type == "response.output_text.delta" and hasattr(ev, "delta"):
+            txt += ev.delta
+    print(f"[DEBUG] send finished | chars={len(txt)}", flush=True)
+    return txt
 
-    # Output Format
+# ---- sidebar ---------------------------------------------------------------
+with st.sidebar:
+    if st.button("🔄 New conversation"): ss.clear(); st.rerun()
+    ss.system = st.text_area("System prompt", value=ss.get("system", SYSTEM_PROMPT),
+                             height=280)
 
-    - Initial understanding in short bullet points summarizing the user query.
-    - Concise follow-up questions if necessary, in full sentences.
-    - A list of suggested products with brief descriptions.
+# ---- optional image --------------------------------------------------------
+up = st.file_uploader("Reference image (optional)", ["png","jpg","jpeg"])
+if up:
+    mime = up.type or "image/png"
+    ss.image = f"data:{mime};base64,{base64.b64encode(up.read()).decode()}"
+    st.image(ss.image, caption="Uploaded reference", use_container_width=True)
 
-    # Examples
+st.divider()
 
-    **Example 1:**
+# ---- chat input ------------------------------------------------------------
+query = st.text_input("Type your message", key="chat_input")
+send_click = st.button("Send", use_container_width=True)
 
-    **User Query:** "I'm looking for eco-friendly packaging options for skincare products."
+# ---- conversation logic ----------------------------------------------------
+if send_click and query.strip():
+    ss.messages.append({"role":"user","content":query})
 
-    **Assistant Response:**
-    Here are some initial suggestions:
-    1. CKS Packaging 2oz Cosmo Round – 469
+    # ----------- build event list for GPT -----------------------------------
+    events = [{"role":"system","content":ss.system},
+              *[{k:v for k,v in m.items() if k in ("role","content")}
+                for m in ss.messages[-20:]]]
+    if ss.image:
+        events.append({"role":"user",
+                       "content":[{"type":"input_image","image_url": ss.image}]})
 
-    Capacity: 2 oz  
-    Material: HDPE, Round shape  
-    Finish: 20mm-410, 20mm-415  
-    Lightweight and portable—great for retail face moisturizer packaging  
-    image_url:https://generic.webpackaging.com/img/live/2537/13914521/13550373/13570224-DWIKMYMB/main/Mold_469.png
+    with st.spinner("PackagingPal is thinking…"):
+        assistant_text = send(events)
 
-    Are you interested in a specific type of skincare product packaging, such as bottles, tubes, or jars? Let me know if you have any specific requirements or if you'd like to see more products!
+    ss.messages.append({"role":"assistant","content":assistant_text})
 
-    # Notes
+    # ----------- reached trigger? ------------------------------------------
+    if "###SEARCH###" in assistant_text:
+        search_q = assistant_text.split("###SEARCH###",1)[1].strip().splitlines()[0]
+        print(f"[DEBUG] Trigger → {search_q}", flush=True)
 
-    - Consider user preferences like material choice, sustainability, and specific product types when suggesting options.
-    - Stay up-to-date with the latest trends and products in packaging and cosmetics.
-    - Display the images when possible. Do not display the images for Plastirey products.
-    """
+        hits = impacked_search(search_q, k=50)
+        print(f"[DEBUG] Impacked hits: {len(hits)}", flush=True)
 
-###############################################################################
-# 2) Streamlit UI Layout
-###############################################################################
-st.set_page_config(page_title="GPT-4.1 Responses API Demo", layout="centered")
-st.title("GPT-4.1 Chat (Responses API)")
+        rec_events = [
+            {"role":"system","content":ss.system},
+            {"role":"user",
+             "content": f"IMPACKED_HITS:\n```json\n{hits_for_llm(hits)}\n```"}]
+        if ss.image:
+            rec_events.append({"role":"user",
+                               "content":[{"type":"input_image","image_url": ss.image}]})
 
-# 2A) Developer instructions editor
-st.markdown("#### Developer Instructions")
-with st.expander("Edit developer instructions (advanced)", expanded=False):
-    updated_instructions = st.text_area(
-        "Edit developer instructions:",
-        value=st.session_state.developer_instructions,
-        height=200
-    )
-    st.session_state.developer_instructions = updated_instructions
+        tools = [{"type":"file_search","vector_store_ids":[VECTOR_STORE_ID]}]
 
-# 2B) Optional Image uploader
-st.markdown("#### Optional: Upload an image to pass to GPT-4.1")
-uploaded_img = st.file_uploader("Upload an image (png, jpg, etc.)", type=["png", "jpg", "jpeg"])
-image_url = None
-if uploaded_img:
-    image_bytes = uploaded_img.read()
-    b64_data = base64.b64encode(image_bytes).decode("utf-8")
-    mime_type = uploaded_img.type or "image/png"
-    image_url = f"data:{mime_type};base64,{b64_data}"
-    st.image(image_bytes, caption="Preview of your uploaded image", use_column_width=True)
+        with st.spinner("Retrieving products…"):
+            rec_text = send(rec_events, tools=tools, max_tokens=1800)
 
-st.markdown("---")
-st.markdown("### Conversation History")
+        ss.messages.append({"role":"assistant","content":rec_text})
 
-for i, msg in enumerate(st.session_state.messages):
-    if msg["role"] == "user":
-        message(msg["content"], is_user=True, key=f"user_{i}")
-    else:
-        content = msg["content"]
-        pattern = r"image_url\s*:\s*(https?://\S+)"
-        urls = re.findall(pattern, content)
-        # Display assistant message without image_url tag for cleanliness
-        cleaned_content = re.sub(r"image_url\s*:\s*https?://\S+", "", content).strip()
-        message(cleaned_content, key=f"assistant_{i}")
-        if urls:
-            for url in urls:
-                st.markdown(
-                    f"""
-                    <div style="display: flex; justify-content: flex-start; margin: -0.5em 0 1.5em 2.5em;">
-                        <img src="{url}" style="max-width: 220px; max-height: 160px; border-radius: 0.5em; box-shadow: 0 2px 6px rgba(0,0,0,0.16);" alt="Product image"/>
-                    </div>
-                    """, unsafe_allow_html=True)
+    st.rerun()   # refresh UI with the newly appended message(s)
 
-st.markdown("#### Ask GPT-4.1 a question, or say something:")
-user_input = st.text_input("Your message", "", key="chat_input")
-if st.button("Send"):
-    if not user_input.strip():
-        st.warning("Please enter some text before sending.")
-    else:
-        st.session_state.messages.append({"role": "user", "content": user_input})
-        input_messages = []
-        developer_instructions = st.session_state.developer_instructions
-        for msg in st.session_state.messages:
-            input_messages.append({"role": msg["role"], "content": msg["content"]})
-        if image_url:
-            input_messages.append({
-                "role": "user",
-                "content": [
-                    {"type": "input_image", "image_url": image_url}
-                ]
-            })
-        try:
-            with st.spinner("GPT-4.1 is thinking..."):
-                # If you want to keep the assistant stream expander, it only shows partials.
-                with st.expander("Assistant Stream (click to expand)", expanded=False):
-                    partial_display = st.empty()
-                    partial_assistant_text = ""
-                    stream = client.responses.create(
-                        model="gpt-4.1",
-                        instructions=developer_instructions,
-                        input=input_messages,
-                        stream=True,
-                        reasoning={},
-                        tools=[{
-                            "type": "file_search",
-                            "vector_store_ids": ["vs_67fd31e9c4c081919a9c34d1be81e2d9"]
-                        }],
-                        temperature=1,
-                        max_output_tokens=16384,
-                        top_p=1,
-                        store=True
-                    )
-                    for event in stream:
-                        if event.type == "response.output_text.delta" and hasattr(event, "delta"):
-                            partial_assistant_text += event.delta
-                            partial_display.markdown(f"**Assistant**: {partial_assistant_text}")
-                # After streaming, append final message
-                st.session_state.messages.append(
-                    {"role": "assistant", "content": partial_assistant_text}
-                )
-        except Exception as e:
-            st.error(f"Error calling GPT-4.1: {e}")
+# ---- render chat history ---------------------------------------------------
+for m in ss.messages:
+    st.chat_message(m["role"]).markdown(m["content"], unsafe_allow_html=True)
 
-
-
+st.divider()
